@@ -1,0 +1,104 @@
+# ==========================================
+# PYTHON VIRTUAL ENVIRONMENTS
+# ==========================================
+
+.venv/
+venv/
+env/
+ENV/
+
+
+# ==========================================
+# PYTHON CACHE
+# ==========================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+
+# ==========================================
+# ENVIRONMENT VARIABLES & SECRETS
+# ==========================================
+
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+
+
+# ==========================================
+# PYTORCH & MACHINE LEARNING MODELS
+# ==========================================
+
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+checkpoints/
+models/
+weights/
+
+
+# ==========================================
+# HUGGING FACE CACHE
+# ==========================================
+
+.cache/
+huggingface/
+hf_cache/
+
+
+# ==========================================
+# GENERATED RESULTS
+# ==========================================
+
+output/
+outputs/
+results/
+logs/
+*.log
+*.npy
+*.npz
+
+
+# ==========================================
+# DATASETS & IMAGES
+# ==========================================
+
+images/
+datasets/
+data/
+
+
+# ==========================================
+# JUPYTER NOTEBOOKS
+# ==========================================
+
+.ipynb_checkpoints/
+
+
+# ==========================================
+# IDE & EDITOR FILES
+# ==========================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+
+# ==========================================
+# OPERATING SYSTEM FILES
+# ==========================================
+
+.DS_Store
+Thumbs.db
+*~
