@@ -3,586 +3,400 @@
 """
 train_classifier.py
 
-Train an image classifier using DINOv2's pretrained visual features.
+Train a terrain classifier using manually collected images and DINOv2 features.
 
-Classes:
-    1. Corn
-    2. Soil
-    3. Grass
-    4. Rock
+Dataset structure:
+    dataset/
+        corn/       # Images of corn plants or cornfields
+        soil/       # Images of soil
+        grass/      # Images of grass
+        rock/       # Images of rocks
+
+Each class should have at least 3 images; 10 or more is recommended.
+The script automatically splits each class into training, validation, and
+testing images. For 10 images per class, the split is 8 / 1 / 1.
 
 Methods:
-    1. K-Nearest Neighbors (Cosine Similarity)
-    2. Linear Classifier (Cross-Entropy Loss)
+    1. k-Nearest Neighbors using cosine distance (no neural network training)
+    2. Linear classifier trained on frozen DINOv2 image features
 
 Evaluation:
-    1. Accuracy
-    2. Precision
-    3. Recall
-    4. F1 Score
-    5. Confusion Matrix
+    Accuracy, precision, recall, F1 score, and confusion matrix
 
 Usage:
     python3 train_classifier.py
-    python3 train_classifier.py --epochs 50
-    python3 train_classifier.py --dataset dataset
+    python3 train_classifier.py --dataset dataset --epochs 50
+    python3 train_classifier.py --output models/terrain_classifier.pth
 """
 
 import argparse
+import random
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from PIL import Image
-from transformers import AutoImageProcessor, AutoModel
-
+from PIL import Image, UnidentifiedImageError
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix
-)
+from transformers import AutoImageProcessor, AutoModel
 
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 
-# Pretrained DINOv2 Small model (384 features)
+# Pretrained DINOv2 Small returns a 384-dimensional image feature vector.
 MODEL_NAME = "facebook/dinov2-small"
 
-# Use NVIDIA GPU if available, otherwise CPU
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Classification categories
+# Names must match the four directories inside dataset/.
 CLASSES = ["corn", "soil", "grass", "rock"]
-
-# Supported image formats
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
-# Model configuration
-FEATURE_DIM = 384
-NUM_CLASSES = len(CLASSES)
+# For each class, 80% of images go to training, with at least one reserved
+# for validation and at least one for testing.
+TRAIN_RATIO = 0.80
+RANDOM_SEED = 42
 
-# Training configuration
+# Linear classifier settings.
 EPOCHS = 30
 LEARNING_RATE = 0.001
 
-# Number of neighbors for k-NN classification
+# Number of neighbors for cosine distance-based k-NN.
 K_NEIGHBORS = 3
 
-# Saved classifier location
+# Saved PyTorch model checkpoint.
 MODEL_PATH = "models/terrain_classifier.pth"
 
+# Use an NVIDIA GPU if one is available; otherwise run on the CPU.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # ==========================================
-# LOAD DINOV2
+# DATASET VALIDATION AND SPLITTING
 # ==========================================
 
-# Load pretrained DINOv2 for feature extraction
+def find_images(dataset_dir):
+    """Find and verify images in each of the four class folders."""
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(f"Dataset folder not found: {dataset_dir}")
+
+    images_by_class = {}
+
+    for class_name in CLASSES:
+        class_dir = dataset_dir / class_name
+        if not class_dir.is_dir():
+            raise FileNotFoundError(f"Missing class folder: {class_dir}")
+
+        image_paths = sorted(
+            path for path in class_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+
+        valid_paths = []
+        for path in image_paths:
+            try:
+                # verify() identifies corrupt/non-image files before training.
+                with Image.open(path) as image:
+                    image.verify()
+                valid_paths.append(path)
+            except (OSError, ValueError, UnidentifiedImageError) as error:
+                print(f"Warning: skipping {path}: {error}")
+
+        if len(valid_paths) < 3:
+            raise ValueError(
+                f"{class_name} has {len(valid_paths)} valid images; "
+                "at least 3 are needed (10 recommended)."
+            )
+
+        images_by_class[class_name] = valid_paths
+        print(f"{class_name:>6}: {len(valid_paths)} valid images")
+
+    return images_by_class
+
+
+def split_dataset(images_by_class, seed):
+    """Create reproducible, non-overlapping train/val/test splits."""
+    rng = random.Random(seed)
+    splits = {"train": [], "val": [], "test": []}
+
+    for label, class_name in enumerate(CLASSES):
+        paths = images_by_class[class_name].copy()
+        rng.shuffle(paths)
+
+        # Reserve one image for validation and testing, even for small classes.
+        num_train = min(int(len(paths) * TRAIN_RATIO), len(paths) - 2)
+        num_train = max(1, num_train)
+        remaining = len(paths) - num_train
+        num_val = max(1, remaining // 2)
+
+        train_paths = paths[:num_train]
+        val_paths = paths[num_train:num_train + num_val]
+        test_paths = paths[num_train + num_val:]
+
+        for split_name, subset in (
+            ("train", train_paths),
+            ("val", val_paths),
+            ("test", test_paths),
+        ):
+            splits[split_name].extend((path, label) for path in subset)
+
+        print(
+            f"{class_name:>6}: "
+            f"train={len(train_paths)}, "
+            f"val={len(val_paths)}, "
+            f"test={len(test_paths)}"
+        )
+
+    return splits
+
+
+# ==========================================
+# LOAD PRETRAINED DINOV2
+# ==========================================
+
 def load_dinov2():
+    """Load the frozen DINOv2 image encoder and its image processor."""
+    print(f"\nUsing device: {DEVICE}")
+    print(f"Loading pretrained model: {MODEL_NAME}")
 
-    print(f"Using device: {device}")
-    print("Loading DINOv2...")
-
-    # Load image processor and pretrained model
     processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-    model = AutoModel.from_pretrained(MODEL_NAME)
+    model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
 
-    # Move model to GPU/CPU and enable evaluation mode
-    model = model.to(device)
+    # Freeze DINOv2 weights. Only the linear classifier will be trained.
     model.eval()
-
-    print("DINOv2 loaded successfully!")
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
 
     return processor, model
 
 
 # ==========================================
-# EXTRACT FEATURES
+# EXTRACT DINOV2 FEATURES
 # ==========================================
 
-# Extract the 384-dimensional CLS feature vector from an image
-def get_features(image_path, processor, model):
+def extract_features(items, processor, model, split_name):
+    """Convert image paths into normalized DINOv2 CLS feature vectors."""
+    feature_list = []
+    label_list = []
 
-    # Load image and convert to RGB
-    with Image.open(image_path) as image:
-        image = image.convert("RGB")
+    print(f"\n========== {split_name.upper()} IMAGES ==========")
+    for index, (image_path, label) in enumerate(items, start=1):
+        print(f"[{index}/{len(items)}] {CLASSES[label]}: {image_path.name}")
 
-        # Prepare image for DINOv2
-        inputs = processor(
-            images=image,
-            return_tensors="pt"
-        ).to(device)
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            inputs = processor(images=image, return_tensors="pt")
 
-    # Run inference without calculating gradients
-    with torch.inference_mode():
-        outputs = model(**inputs)
+        # Move the processor's tensors to the same device as DINOv2.
+        inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
 
-    # Extract CLS token representing the entire image
-    features = outputs.last_hidden_state[:, 0, :]
+        with torch.inference_mode():
+            outputs = model(**inputs)
+            cls_features = outputs.last_hidden_state[:, 0, :]
+            cls_features = F.normalize(cls_features, p=2, dim=1)
 
-    # Normalize feature vector for cosine similarity
-    features = F.normalize(features, p=2, dim=1)
+        feature_list.append(cls_features.squeeze(0).cpu())
+        label_list.append(label)
 
-    return features
-
-
-# ==========================================
-# LOAD DATASET
-# ==========================================
-
-# Extract image features and labels from each category folder
-def load_dataset(dataset_dir, processor, model):
-
-    dataset_dir = Path(dataset_dir)
-
-    # Verify dataset folder exists
-    if not dataset_dir.is_dir():
-        raise ValueError(
-            f"Dataset directory does not exist: {dataset_dir}"
-        )
-
-    features_list = []
-    labels_list = []
-
-    # Process each classification category
-    for label, class_name in enumerate(CLASSES):
-
-        class_dir = dataset_dir / class_name
-
-        # Verify category folder exists
-        if not class_dir.is_dir():
-            raise ValueError(
-                f"Missing class directory: {class_dir}"
-            )
-
-        # Find all supported image files
-        image_paths = sorted(
-            path for path in class_dir.rglob("*")
-            if path.is_file()
-            and path.suffix.lower() in IMAGE_EXTENSIONS
-        )
-
-        print(f"\nClass: {class_name}")
-        print(f"Images: {len(image_paths)}")
-
-        # Extract features from each image
-        for index, image_path in enumerate(image_paths, start=1):
-
-            print(
-                f"[{index}/{len(image_paths)}] "
-                f"Processing: {image_path.name}"
-            )
-
-            features = get_features(
-                image_path,
-                processor,
-                model
-            )
-
-            # Move features to CPU
-            features_list.append(
-                features.squeeze(0).cpu()
-            )
-
-            labels_list.append(label)
-
-    # Verify images were loaded
-    if not features_list:
-        raise ValueError(
-            f"No supported images found in: {dataset_dir}"
-        )
-
-    # Combine features into matrix [N, 384]
-    features = torch.stack(features_list)
-
-    # Convert labels to tensor
-    labels = torch.tensor(
-        labels_list,
-        dtype=torch.long
+    return (
+        torch.stack(feature_list),
+        torch.tensor(label_list, dtype=torch.long),
     )
 
-    return features, labels
+
+# ==========================================
+# EVALUATION METRICS
+# ==========================================
+
+def evaluate_results(true_labels, predictions):
+    """Print accuracy and class-level statistics for the test images."""
+    accuracy = accuracy_score(true_labels, predictions)
+    print(f"\nAccuracy: {accuracy * 100:.2f}%")
+
+    print("\nClassification Report:")
+    print(classification_report(
+        true_labels,
+        predictions,
+        labels=list(range(len(CLASSES))),
+        target_names=CLASSES,
+        zero_division=0,
+    ))
+
+    print("Confusion Matrix (rows=actual, columns=predicted):")
+    print(confusion_matrix(
+        true_labels,
+        predictions,
+        labels=list(range(len(CLASSES))),
+    ))
 
 
 # ==========================================
 # K-NEAREST NEIGHBORS
 # ==========================================
 
-# Classify images using cosine distance between DINOv2 features
-def evaluate_knn(train_features, train_labels,
-                 test_features, test_labels):
-
+def evaluate_knn(train_features, train_labels, test_features, test_labels):
+    """Compare test features to labeled training features using cosine distance."""
     print("\n========== K-NN CLASSIFIER ==========")
 
-    # Convert feature tensors to NumPy arrays
-    X_train = train_features.numpy()
-    y_train = train_labels.numpy()
-
-    X_test = test_features.numpy()
-    y_test = test_labels.numpy()
-
-    # Create k-NN classifier using cosine distance
+    # The embeddings are already normalized for cosine comparisons.
     knn = KNeighborsClassifier(
-        n_neighbors=min(K_NEIGHBORS, len(X_train)),
-        metric="cosine"
+        n_neighbors=min(K_NEIGHBORS, len(train_labels)),
+        metric="cosine",
     )
-
-    # Store labeled training features
-    knn.fit(X_train, y_train)
-
-    # Predict test image categories
-    predictions = knn.predict(X_test)
-
-    # Calculate evaluation metrics
-    evaluate_results(y_test, predictions)
-
-    return knn
-
-
-# ==========================================
-# LINEAR CLASSIFIER
-# ==========================================
-
-# Create a trainable linear layer for four categories
-def create_classifier():
-
-    # Convert 384 DINOv2 features into 4 class scores
-    classifier = nn.Linear(
-        FEATURE_DIM,
-        NUM_CLASSES
-    )
-
-    return classifier.to(device)
+    knn.fit(train_features.numpy(), train_labels.numpy())
+    predictions = knn.predict(test_features.numpy())
+    evaluate_results(test_labels.numpy(), predictions)
 
 
 # ==========================================
 # TRAIN LINEAR CLASSIFIER
 # ==========================================
 
-# Train the classification layer using labeled DINOv2 features
 def train_classifier(train_features, train_labels,
                      val_features, val_labels, epochs):
+    """Train a small linear classifier on top of frozen DINOv2 features."""
+    print("\n========== TRAINING LINEAR CLASSIFIER ==========")
 
-    print("\n========== TRAINING CLASSIFIER ==========")
-
-    # Create classification layer
-    classifier = create_classifier()
-
-    # Cross-entropy loss for multiclass classification
+    # Determine feature size from the loaded model rather than hardcoding 384.
+    feature_dim = train_features.shape[1]
+    classifier = nn.Linear(feature_dim, len(CLASSES)).to(DEVICE)
+    optimizer = torch.optim.Adam(classifier.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
 
-    # Adam optimizer updates classifier weights
-    optimizer = torch.optim.Adam(
-        classifier.parameters(),
-        lr=LEARNING_RATE
-    )
+    X_train, y_train = train_features.to(DEVICE), train_labels.to(DEVICE)
+    X_val, y_val = val_features.to(DEVICE), val_labels.to(DEVICE)
 
-    # Move training data to GPU/CPU
-    X_train = train_features.to(device)
-    y_train = train_labels.to(device)
-
-    X_val = val_features.to(device)
-    y_val = val_labels.to(device)
-
-    best_accuracy = -1.0
+    best_val_loss = float("inf")
     best_state = None
 
-    # Train classifier for specified epochs
-    for epoch in range(epochs):
-
+    for epoch in range(1, epochs + 1):
         classifier.train()
-
-        # Reset gradients
         optimizer.zero_grad()
 
-        # Generate class scores
         outputs = classifier(X_train)
-
-        # Calculate classification loss
         loss = criterion(outputs, y_train)
-
-        # Calculate gradients and update weights
         loss.backward()
         optimizer.step()
 
-        # Evaluate classifier using validation images
         classifier.eval()
-
         with torch.inference_mode():
-
             val_outputs = classifier(X_val)
+            val_loss = criterion(val_outputs, y_val).item()
+            val_predictions = val_outputs.argmax(dim=1)
+            val_accuracy = (val_predictions == y_val).float().mean().item()
 
-            predictions = torch.argmax(
-                val_outputs,
-                dim=1
-            )
-
-            accuracy = (
-                (predictions == y_val)
-                .float()
-                .mean()
-                .item()
-            )
-
-        # Save best classifier weights in memory
-        if accuracy > best_accuracy:
-
-            best_accuracy = accuracy
-
+        # Keep the checkpoint with the lowest validation loss.
+        if np.isfinite(val_loss) and val_loss < best_val_loss:
+            best_val_loss = val_loss
             best_state = {
-                name: value.detach().cpu().clone()
-                for name, value in classifier.state_dict().items()
+                name: tensor.detach().cpu().clone()
+                for name, tensor in classifier.state_dict().items()
             }
 
-        # Display training progress
         print(
-            f"Epoch [{epoch + 1}/{epochs}] "
-            f"Loss: {loss.item():.4f} "
-            f"Val Accuracy: {accuracy * 100:.2f}%"
+            f"Epoch [{epoch}/{epochs}] "
+            f"Train Loss: {loss.item():.4f} "
+            f"Val Loss: {val_loss:.4f} "
+            f"Val Accuracy: {val_accuracy * 100:.2f}%"
         )
 
-    # Restore best validation model
-    if best_state is not None:
+    # This explicit check also avoids the Pylance optional-state error.
+    if best_state is None:
+        raise RuntimeError("No valid model state was saved during training.")
 
-        classifier.load_state_dict(best_state)
-
-    else:
-
-        raise RuntimeError(
-            "Training failed: No valid classifier state was saved."
-        )
-
-    print("\nTraining complete!")
-    print(f"Best validation accuracy: {best_accuracy * 100:.2f}%")
-
+    classifier.load_state_dict(best_state)
+    print(f"\nBest validation loss: {best_val_loss:.4f}")
     return classifier
-
-
-# ==========================================
-# EVALUATE RESULTS
-# ==========================================
-
-# Calculate accuracy, precision, recall, F1 score, and confusion matrix
-def evaluate_results(true_labels, predictions):
-
-    # Calculate overall classification accuracy
-    accuracy = accuracy_score(
-        true_labels,
-        predictions
-    )
-
-    print(f"\nAccuracy: {accuracy * 100:.2f}%")
-
-    # Display precision, recall, and F1 score
-    print("\nClassification Report:")
-
-    print(
-        classification_report(
-            true_labels,
-            predictions,
-            labels=list(range(NUM_CLASSES)),
-            target_names=CLASSES,
-            zero_division=0
-        )
-    )
-
-    # Display confusion matrix
-    print("Confusion Matrix:")
-
-    matrix = confusion_matrix(
-        true_labels,
-        predictions,
-        labels=list(range(NUM_CLASSES))
-    )
-
-    print(matrix)
 
 
 # ==========================================
 # TEST LINEAR CLASSIFIER
 # ==========================================
 
-# Evaluate trained classifier using unseen test images
 def test_classifier(classifier, test_features, test_labels):
-
-    print("\n========== LINEAR CLASSIFIER ==========")
-
+    """Evaluate the selected linear classifier on held-out test images."""
+    print("\n========== LINEAR CLASSIFIER TEST ==========")
     classifier.eval()
 
-    # Move test data to GPU/CPU
-    X_test = test_features.to(device)
-
-    # Run inference without calculating gradients
     with torch.inference_mode():
+        outputs = classifier(test_features.to(DEVICE))
+        predictions = outputs.argmax(dim=1).cpu().numpy()
 
-        outputs = classifier(X_test)
-
-        # Select class with highest score
-        predictions = torch.argmax(
-            outputs,
-            dim=1
-        )
-
-    # Move predictions to CPU
-    predictions = predictions.cpu().numpy()
-
-    true_labels = test_labels.numpy()
-
-    # Calculate evaluation metrics
-    evaluate_results(true_labels, predictions)
+    evaluate_results(test_labels.numpy(), predictions)
 
 
 # ==========================================
 # SAVE CLASSIFIER
 # ==========================================
 
-# Save trained classifier weights and class names
-def save_classifier(classifier, model_path):
+def save_classifier(classifier, output_path):
+    """Save the linear classifier and metadata needed for future predictions."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    model_path = Path(model_path)
-
-    # Create models folder if needed
-    model_path.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    # Save classifier and model configuration
-    torch.save(
-        {
-            "model_state_dict": classifier.cpu().state_dict(),
-            "classes": CLASSES,
-            "feature_dim": FEATURE_DIM,
-            "model_name": MODEL_NAME,
-            "normalized_features": True
-        },
-        model_path
-    )
-
-    print(f"\nClassifier saved: {model_path}")
+    torch.save({
+        "model_state_dict": classifier.cpu().state_dict(),
+        "classes": CLASSES,
+        "feature_dim": classifier.in_features,
+        "model_name": MODEL_NAME,
+        "normalized_features": True,
+    }, output_path)
+    print(f"\nSaved classifier: {output_path}")
 
 
 # ==========================================
-# MAIN
+# MAIN PROGRAM
 # ==========================================
 
-# Parse command-line arguments and train image classifier
 def main():
-
     parser = argparse.ArgumentParser(
-        description="Train image classifier using DINOv2 features."
+        description="Train a DINOv2 classifier from four image folders."
     )
-
-    # Dataset folder containing train, val, and test
-    parser.add_argument(
-        "--dataset",
-        default="dataset",
-        help="Path to dataset directory"
-    )
-
-    # Number of training epochs
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=EPOCHS,
-        help="Number of training epochs"
-    )
-
-    # Saved classifier location
-    parser.add_argument(
-        "--output",
-        default=MODEL_PATH,
-        help="Path to save trained classifier"
-    )
-
+    parser.add_argument("--dataset", default="dataset", help="Image dataset folder")
+    parser.add_argument("--epochs", type=int, default=EPOCHS, help="Training epochs")
+    parser.add_argument("--output", default=MODEL_PATH, help="Saved model path")
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED, help="Random seed")
     args = parser.parse_args()
 
     if args.epochs < 1:
         parser.error("--epochs must be at least 1")
 
-    # Load pretrained DINOv2
+    # Use the same random seed for splitting and classifier initialization.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # Check image folders before downloading/loading the pretrained model.
+    print("========== DATASET CHECK ==========")
+    images_by_class = find_images(args.dataset)
+    print("\n========== AUTOMATIC DATASET SPLIT ==========")
+    splits = split_dataset(images_by_class, args.seed)
+
     processor, model = load_dinov2()
 
-    dataset_dir = Path(args.dataset)
-
-    # Extract features from training images
-    print("\n========== TRAINING DATA ==========")
-
-    train_features, train_labels = load_dataset(
-        dataset_dir / "train",
-        processor,
-        model
+    # Extract features once; no DINOv2 backpropagation is performed.
+    train_features, train_labels = extract_features(
+        splits["train"], processor, model, "train"
+    )
+    val_features, val_labels = extract_features(
+        splits["val"], processor, model, "validation"
+    )
+    test_features, test_labels = extract_features(
+        splits["test"], processor, model, "test"
     )
 
-    # Extract features from validation images
-    print("\n========== VALIDATION DATA ==========")
+    evaluate_knn(train_features, train_labels, test_features, test_labels)
 
-    val_features, val_labels = load_dataset(
-        dataset_dir / "val",
-        processor,
-        model
-    )
-
-    # Extract features from testing images
-    print("\n========== TEST DATA ==========")
-
-    test_features, test_labels = load_dataset(
-        dataset_dir / "test",
-        processor,
-        model
-    )
-
-    # Verify every class has training, validation, and test images
-    for split_name, labels in [
-        ("train", train_labels),
-        ("val", val_labels),
-        ("test", test_labels)
-    ]:
-
-        counts = torch.bincount(
-            labels,
-            minlength=NUM_CLASSES
-        )
-
-        if torch.any(counts == 0):
-            raise ValueError(
-                f"{split_name} must contain images for all four classes."
-            )
-
-    # Evaluate cosine similarity-based k-NN on test images
-    evaluate_knn(
-        train_features,
-        train_labels,
-        test_features,
-        test_labels
-    )
-
-    # Train linear classifier
     classifier = train_classifier(
-        train_features,
-        train_labels,
-        val_features,
-        val_labels,
-        args.epochs
+        train_features, train_labels, val_features, val_labels, args.epochs
     )
-
-    # Evaluate trained classifier
-    test_classifier(
-        classifier,
-        test_features,
-        test_labels
-    )
-
-    # Save trained classifier
-    save_classifier(
-        classifier,
-        args.output
-    )
+    test_classifier(classifier, test_features, test_labels)
+    save_classifier(classifier, args.output)
 
 
 if __name__ == "__main__":
