@@ -435,3 +435,13 @@ Generated files, local datasets, and virtual environments can be excluded from G
 - Softmax scores are not calibrated confidence estimates.
 - A larger and more diverse dataset is required for reliable real-world evaluation.
 - The current project is an experimental foundation for future robotic perception applications.
+
+
+## License
+
+Original source code in this repository is licensed under the MIT License.
+See [LICENSE](LICENSE) for details.
+
+This project uses Meta's DINOv2, which is licensed under Apache 2.0.
+Dataset images remain subject to their original licenses and
+are not covered by this repository's MIT License.
